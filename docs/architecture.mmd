@@ -1,0 +1,42 @@
+flowchart TD
+ A([Submit Article Form<br/>title · URL or text · reviewer email]):::trigger --> B{Has URL?}:::control
+
+ B -->|yes| C[HTTP Fetch URL]:::tool
+ C --> D[Extract Text from HTML]:::det
+ B -->|no| E[Use Pasted Text]:::det
+ D --> F[Validate &amp; Prepare Input<br/>length check · fallback]:::det
+ E --> F
+ F --> G[Chunk Source<br/>overlapping chunks · MAP fan-out]:::det
+
+ G --> H[Summarizer Agent · per chunk<br/>AI ROLE 1 - chunk summary + claims → JSON]:::ai
+ H --> I[Parse Chunk Summary<br/>lenient per-chunk parse]:::det
+ I --> J[Merge Chunk Summaries<br/>REDUCE-prep · dedup claims]:::det
+
+ J --> K[Synthesize Summary<br/>AI ROLE 2 - merge to final summary → JSON]:::ai
+ K --> L[Parse &amp; Validate Synthesis<br/>validate · repair · fallback]:::det
+ L --> M{Retry Synthesis?<br/>bounded self-correction}:::control
+ M -->|"invalid &amp; attempt &lt; 1"| K
+ M -->|valid| N[Inject Test Claim<br/>demo affordance]:::det
+
+ N --> O[Verifier Agent<br/>AI ROLE 3 - skeptical critic, claim vs source → JSON]:::ai
+ O --> P[Score &amp; Decide Route<br/>confidence-weighted trust · 3-tier policy]:::det
+ P --> Q{Route by Trust Tier}:::control
+
+ Q -->|HARD_REVIEW| R[Gmail Send &amp; Wait<br/>Approve / Reject]:::human
+ R --> S[Apply Reviewer Decision<br/>APPROVED or NEEDS_REVISION]:::det
+ Q -->|LIGHT_REVIEW| T[Light Review Notice<br/>auto-publish, flagged]:::det
+ Q -->|AUTO_PUBLISH| U[Status: Auto-Published]:::det
+
+ S --> V[Build Final Report<br/>Markdown + JSON]:::det
+ T --> V
+ U --> V
+ V --> W[Log to Google Sheet]:::tool
+ W --> X[Email Verified Report]:::tool
+ X --> Y([Show Result Form]):::trigger
+
+ classDef ai fill:#7c3aed,stroke:#4c1d95,color:#fff,stroke-width:2px;
+ classDef det fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
+ classDef control fill:#fde68a,stroke:#b45309,color:#7c2d12;
+ classDef tool fill:#dcfce7,stroke:#15803d,color:#14532d;
+ classDef human fill:#fecaca,stroke:#b91c1c,color:#7f1d1d,stroke-width:2px;
+ classDef trigger fill:#f1f5f9,stroke:#475569,color:#1e293b;

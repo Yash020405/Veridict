@@ -1,0 +1,19 @@
+{
+  "_note": "Paste these into the n8n form (Submit Article node). Two scenarios are provided.",
+
+  "scenario_A_high_trust_auto_publish": {
+    "Article Title": "Mediterranean Diet and Cardiovascular Risk (PREDIMED-style abstract)",
+    "Source URL": "",
+    "Reviewer Email": "you@example.com",
+    "Pasted Text": "A multicenter randomized trial enrolled 7,447 participants aged 55 to 80 who were at high cardiovascular risk but had no cardiovascular disease at enrollment. Participants were assigned to one of three diets: a Mediterranean diet supplemented with extra-virgin olive oil, a Mediterranean diet supplemented with mixed nuts, or a control diet for which participants were advised to reduce dietary fat. The primary endpoint was a composite of myocardial infarction, stroke, and death from cardiovascular causes. After a median follow-up of 4.8 years, the trial observed a relative risk reduction of approximately 30 percent for the primary endpoint in the two Mediterranean-diet groups compared with the control group. The benefit was driven largely by a reduction in the incidence of stroke. The authors concluded that among persons at high cardiovascular risk, a Mediterranean diet supplemented with olive oil or nuts reduced the incidence of major cardiovascular events. The trial did not find a statistically significant reduction in death from any cause."
+  },
+
+  "scenario_B_low_trust_human_review": {
+    "Article Title": "Same abstract - but used to demonstrate hallucination catching",
+    "Source URL": "",
+    "Reviewer Email": "you@example.com",
+    "Pasted Text": "A multicenter randomized trial enrolled 7,447 participants aged 55 to 80 at high cardiovascular risk. Participants followed a Mediterranean diet with olive oil, a Mediterranean diet with nuts, or a low-fat control diet. After a median 4.8 years, the Mediterranean-diet groups had about a 30 percent relative reduction in major cardiovascular events versus control, driven mainly by fewer strokes. The trial did not find a significant reduction in all-cause mortality.",
+    "Inject Test Claim": "The diet also reversed type 2 diabetes in 80 percent of patients.",
+    "_how_to_trigger_review": "Just submit this as-is. The 'Inject Test Claim' field adds a claim the source never makes; the Verifier marks it UNSUPPORTED, trust_score drops below 90%, and the run routes deterministically to the Gmail human-review gate. Leave the field blank for a normal, honest run."
+  }
+}

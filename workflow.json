@@ -1,0 +1,982 @@
+{
+  "name": "Veridict - Fact-Checked Research Summarizer",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "Map-reduce two-stage summarizer (chunk -> summarize -> synthesize) with a self-correcting synthesis retry, an independent skeptical Verifier, confidence-weighted deterministic scoring, and 3-tier routing (auto-publish / light review / hard human review). [Groq-free variant: runs on a free Groq API key - no credit card required.]"
+  },
+  "pinData": {},
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Veridict - Fact-Checked Research Summarizer",
+        "formDescription": "Paste an article URL OR raw text. You'll get a fact-checked summary with a trust score and a claim-by-claim verification table. (Leave 'Inject Test Claim' blank for normal use - it is a demo affordance that adds a not-in-source claim so you can watch the Verifier catch a hallucination and route to human review.)",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Article Title",
+              "fieldType": "text",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Source URL",
+              "fieldType": "text",
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Pasted Text",
+              "fieldType": "textarea",
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Reviewer Email",
+              "fieldType": "email",
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Inject Test Claim",
+              "fieldType": "text",
+              "requiredField": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-form-trigger",
+      "name": "Submit Article",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -460,
+        460
+      ],
+      "webhookId": "research-verifier-form"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-node-if-has-url",
+              "leftValue": "={{ ($json['Source URL'] || '').toString().trim() }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-has-url",
+      "name": "Has URL?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -180,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json['Source URL'] }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "node-http-fetch",
+      "name": "Fetch URL Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        120,
+        320
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC: fetched HTML -> clean plain text (no AI)\n  let html = $json.data ?? $json.body ?? $json;\n  if (typeof html !== 'string') html = JSON.stringify(html);\n  let text = html\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#\\d+;/g, ' ')\n    .replace(/\\s+/g, ' ').trim();\n  const title = $('Submit Article').first().json['Article Title'] || 'Untitled';\n  return [{ json: { content: text, title } }];\n"
+      },
+      "id": "node-extract-html",
+      "name": "Extract Text from HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assign-content",
+              "name": "content",
+              "type": "string",
+              "value": "={{ $json['Pasted Text'] }}"
+            },
+            {
+              "id": "assign-title",
+              "name": "title",
+              "type": "string",
+              "value": "={{ $json['Article Title'] }}"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "node-use-pasted",
+      "name": "Use Pasted Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        120,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC validation + FALLBACK. No truncation here - the Chunk node handles length.\n  const item = $input.first().json;\n  let text = (item.content || '').toString().trim();\n  let title = (item.title || 'Untitled').toString().trim();\n  if (text.length < 200) {\n    throw new Error('FALLBACK: source text too short (' + text.length + ' chars). Provide a URL that returns readable article text, or paste at least ~200 characters.');\n  }\n  const HARD_CAP = 60000; // safety ceiling; long docs are chunked, not dropped\n  if (text.length > HARD_CAP) text = text.slice(0, HARD_CAP);\n  return [{ json: { title, source_text: text, char_count: text.length } }];\n"
+      },
+      "id": "node-validate",
+      "name": "Validate & Prepare Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC: split the source into overlapping chunks -> one item per chunk (the MAP fan-out).\n  const { title, source_text } = $input.first().json;\n  const CHUNK = 4000, OVERLAP = 200;\n  const chunks = [];\n  let i = 0;\n  while (i < source_text.length) {\n    const end = Math.min(i + CHUNK, source_text.length);\n    chunks.push(source_text.slice(i, end));\n    if (end >= source_text.length) break;\n    i = end - OVERLAP;\n  }\n  const total = chunks.length || 1;\n  return (chunks.length ? chunks : ['']).map((c, idx) => ({\n    json: { title, chunk_text: c, chunk_index: idx + 1, total_chunks: total }\n  }));\n"
+      },
+      "id": "node-chunk",
+      "name": "Chunk Source",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a meticulous RESEARCH SUMMARIZER agent working on ONE CHUNK of a longer document.\nThis is chunk {{ $json.chunk_index }} of {{ $json.total_chunks }}.\n\nHARD RULES:\n- Use ONLY information present in THIS CHUNK. Never add outside knowledge.\n- Extract the atomic, individually checkable factual claims that appear in THIS CHUNK (0 to 6).\n- Output ONLY valid minified JSON. No markdown, no commentary.\n\nSCHEMA:\n{\"chunk_summary\": string (1-3 sentences), \"claims\": [string]}\n\nTITLE: {{ $json.title }}\n\nCHUNK TEXT:\n{{ $json.chunk_text }}",
+        "messages": {},
+        "batching": {}
+      },
+      "id": "node-summarizer",
+      "name": "Summarizer Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1240,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.2,
+          "maxTokensToSample": 1200
+        }
+      },
+      "id": "node-llm-summarizer",
+      "name": "Groq - Summarizer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC: lenient parse of one chunk's Summarizer output. Never throws - a bad chunk yields no claims.\n  let raw = $json.text ?? $json.response ?? $json.output ?? '';\n  if (typeof raw === 'object') raw = JSON.stringify(raw);\n  raw = raw.toString().replace(/```json/gi, '').replace(/```/g, '').trim();\n  let parsed = null;\n  try { parsed = JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }\n  }\n  const claims = parsed && Array.isArray(parsed.claims)\n    ? parsed.claims.map(c => (typeof c === 'string' ? c : (c && c.claim) || '')).filter(Boolean)\n    : [];\n  const chunk_summary = parsed && parsed.chunk_summary ? String(parsed.chunk_summary) : '';\n  return [{ json: { claims, chunk_summary } }];\n"
+      },
+      "id": "node-parse-chunk",
+      "name": "Parse Chunk Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC REDUCE-prep: gather every chunk's output, dedup claims, concatenate partial summaries.\n  const all = $input.all().map(i => i.json);\n  const summaries = all.map(a => a.chunk_summary).filter(Boolean);\n  const seen = new Set(), dedup = [];\n  for (const a of all) {\n    for (const c of (a.claims || [])) {\n      const t = String(c).trim();\n      const k = t.toLowerCase().replace(/\\s+/g, ' ').slice(0, 120);\n      if (t && !seen.has(k)) { seen.add(k); dedup.push(t); }\n    }\n  }\n  const title = $('Validate & Prepare Input').first().json.title;\n  return [{ json: {\n    title,\n    combined_text: summaries.join('\\n'),\n    candidate_claims: dedup,\n    total_chunks: all.length\n  } }];\n"
+      },
+      "id": "node-merge",
+      "name": "Merge Chunk Summaries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a SYNTHESIS editor performing the REDUCE step of a map-reduce summary.\nYou are given partial summaries and candidate claims extracted from the chunks of one document.\nMerge them into a single faithful summary and a clean, deduplicated claim set.\n\nHARD RULES:\n- Use ONLY the provided material. Add nothing new.\n- Produce 4 to 8 atomic, individually checkable key_claims (merge duplicates, drop trivia).\n- Output ONLY valid minified JSON. No markdown.\n{{ $runIndex > 0 ? 'RETRY: your previous output was not valid JSON. Output ONLY minified JSON, nothing else.' : '' }}\n\nSCHEMA:\n{\"title\": string, \"summary\": string (3-5 sentences), \"key_claims\": [{\"id\": number, \"claim\": string}]}\n\nTITLE: {{ $json.title }}\n\nPARTIAL SUMMARIES:\n{{ $json.combined_text }}\n\nCANDIDATE CLAIMS (JSON):\n{{ JSON.stringify($json.candidate_claims) }}",
+        "messages": {},
+        "batching": {}
+      },
+      "id": "node-synth",
+      "name": "Synthesize Summary",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        2080,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.2,
+          "maxTokensToSample": 1500
+        }
+      },
+      "id": "node-llm-synth",
+      "name": "Groq - Synthesizer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC parse + validate of the Synthesizer JSON, with a bounded self-correction signal.\n  // $runIndex is 0 on the first pass and 1 after one retry -> we allow exactly one retry.\n  let raw = $json.text ?? $json.response ?? $json.output ?? '';\n  if (typeof raw === 'object') raw = JSON.stringify(raw);\n  raw = raw.toString().replace(/```json/gi, '').replace(/```/g, '').trim();\n  let parsed = null;\n  try { parsed = JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }\n  }\n  const ok = !!(parsed && Array.isArray(parsed.key_claims) && parsed.key_claims.length > 0);\n  const attempt = $runIndex;\n  const needs_retry = !ok && attempt < 1;\n  const merge = $('Merge Chunk Summaries').first().json;\n\n  let summary_obj;\n  if (ok) {\n    const claims = parsed.key_claims\n      .map((c, i) => ({ id: c.id ?? (i + 1), claim: String((c && c.claim) || c || '').trim() }))\n      .filter(c => c.claim);\n    summary_obj = { title: parsed.title || merge.title, summary: String(parsed.summary || ''), key_claims: claims };\n  } else {\n    // FALLBACK after the retry budget is spent: build claims deterministically from candidates.\n    const cc = (merge.candidate_claims || []).slice(0, 8).map((c, i) => ({ id: i + 1, claim: c }));\n    summary_obj = { title: merge.title, summary: (merge.combined_text || '').slice(0, 600), key_claims: cc };\n  }\n  return [{ json: {\n    summary_obj, needs_retry, attempt,\n    title: merge.title, combined_text: merge.combined_text, candidate_claims: merge.candidate_claims\n  } }];\n"
+      },
+      "id": "node-parse-synth",
+      "name": "Parse & Validate Synthesis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2360,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-node-if-retry",
+              "leftValue": "={{ $json.needs_retry }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-retry",
+      "name": "Retry Synthesis?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DEMO AFFORDANCE (deterministic, not model output): append the optional injected claim so the\n  // Verifier has a guaranteed not-in-source claim to catch, driving the human-review branch reproducibly.\n  const summary_obj = $json.summary_obj;\n  const inject = ($('Submit Article').first().json['Inject Test Claim'] || '').toString().trim();\n  if (inject) {\n    const nextId = Math.max(0, ...summary_obj.key_claims.map(c => c.id)) + 1;\n    summary_obj.key_claims.push({ id: nextId, claim: inject });\n  }\n  const source_text = $('Validate & Prepare Input').first().json.source_text;\n  return [{ json: { summary_obj, source_text, title: summary_obj.title } }];\n"
+      },
+      "id": "node-inject",
+      "name": "Inject Test Claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2920,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a strict FACT-CHECKING VERIFIER agent. You did NOT write the summary and must be skeptical.\nFor EACH claim, decide whether it is supported by the SOURCE TEXT *only*.\n\nVERDICTS:\n- \"SUPPORTED\": the source clearly states this.\n- \"PARTIAL\": partly supported, or an overstatement/imprecision.\n- \"UNSUPPORTED\": not in the source, or contradicted by it.\n\nFor each claim give a short evidence quote copied from the source (or \"\" if none) and a confidence 0-1.\nOutput ONLY valid minified JSON. No markdown.\n\nSCHEMA:\n{\"verifications\":[{\"id\":number,\"claim\":string,\"verdict\":\"SUPPORTED|PARTIAL|UNSUPPORTED\",\"evidence\":string,\"confidence\":number}]}\n\nSOURCE TEXT:\n{{ $json.source_text }}\n\nCLAIMS TO VERIFY (JSON):\n{{ JSON.stringify($json.summary_obj.key_claims) }}",
+        "messages": {},
+        "batching": {}
+      },
+      "id": "node-verifier",
+      "name": "Verifier Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        3200,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0,
+          "maxTokensToSample": 2000
+        }
+      },
+      "id": "node-llm-verifier",
+      "name": "Groq - Verifier",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        3200,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC scoring + 3-tier routing policy (no AI). Confidence-weighted, with a hard unsupported gate.\n  let raw = $json.text ?? $json.response ?? $json.output ?? '';\n  if (typeof raw === 'object') raw = JSON.stringify(raw);\n  raw = raw.toString().replace(/```json/gi, '').replace(/```/g, '').trim();\n  let v = null;\n  try { v = JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { v = JSON.parse(m[0]); } catch (e2) {} }\n  }\n  const summary = $('Inject Test Claim').first().json.summary_obj;\n  const title = $('Inject Test Claim').first().json.title;\n\n  // FALLBACK: unusable verifier output -> mark everything UNSUPPORTED -> forces the safe (review) path.\n  if (!v || !Array.isArray(v.verifications) || v.verifications.length === 0) {\n    v = { verifications: (summary.key_claims || []).map(c => ({ id: c.id, claim: c.claim, verdict: 'UNSUPPORTED', evidence: '', confidence: 0 })) };\n  }\n\n  const total = v.verifications.length || 1;\n  const supported = v.verifications.filter(x => x.verdict === 'SUPPORTED').length;\n  const partial = v.verifications.filter(x => x.verdict === 'PARTIAL').length;\n  const unsupported = v.verifications.filter(x => x.verdict === 'UNSUPPORTED').length;\n\n  const trust_score = Math.round((supported / total) * 100);\n  let wsum = 0;\n  for (const x of v.verifications) {\n    const c = Math.max(0, Math.min(1, Number(x.confidence) || 0));\n    if (x.verdict === 'SUPPORTED') wsum += c;\n    else if (x.verdict === 'PARTIAL') wsum += 0.5 * c;\n  }\n  const weighted_score = Math.round((wsum / total) * 100);\n  const low_conf = v.verifications.some(x => x.verdict === 'SUPPORTED' && (Number(x.confidence) || 0) < 0.5);\n\n  // POLICY (lives in code, not in a prompt, so it can't drift run-to-run):\n  let route, needs_review;\n  if (unsupported > 0 || weighted_score < 70) { route = 'HARD_REVIEW'; needs_review = true; }\n  else if (trust_score < 90 || partial > 0 || low_conf) { route = 'LIGHT_REVIEW'; needs_review = false; }\n  else { route = 'AUTO_PUBLISH'; needs_review = false; }\n\n  return [{ json: {\n    title, summary, verifications: v.verifications,\n    stats: { total, supported, partial, unsupported, trust_score, weighted_score, low_conf, n_chunks: $('Merge Chunk Summaries').first().json.total_chunks },\n    route, needs_review,\n    reviewer_email: $('Submit Article').first().json['Reviewer Email'] || ''\n  } }];\n"
+      },
+      "id": "node-score",
+      "name": "Score & Decide Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3480,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-HARD_REVIEW",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "HARD_REVIEW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "HARD_REVIEW"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-LIGHT_REVIEW",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "LIGHT_REVIEW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "LIGHT_REVIEW"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-AUTO_PUBLISH",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "AUTO_PUBLISH",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "AUTO_PUBLISH"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-switch",
+      "name": "Route by Trust Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3760,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.reviewer_email || 'reviewer@example.com' }}",
+        "subject": "=Review needed: {{ $json.title }} (trust {{ $json.stats.trust_score }}%)",
+        "message": "=The verified summary for \"{{ $json.title }}\" needs your sign-off.\n\nTrust score: {{ $json.stats.trust_score }}% (confidence-weighted {{ $json.stats.weighted_score }}%)\nUnsupported: {{ $json.stats.unsupported }} | Partial: {{ $json.stats.partial }} | Supported: {{ $json.stats.supported }}/{{ $json.stats.total }}\n\nApprove to publish, or Reject to send it back for revision.",
+        "operation": "sendAndWait",
+        "responseType": "approval",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Approve",
+            "disapproveLabel": "Reject"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-human-review",
+      "name": "Human Review (Approve/Reject)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4040,
+        320
+      ],
+      "webhookId": "research-verifier-approval"
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC: turn the human reviewer's click into a status.\n  const approved = $json.data && $json.data.approved === true;\n  const p = $('Score & Decide Route').first().json;\n  return [{ json: {\n    ...p,\n    status: approved ? 'APPROVED_BY_REVIEWER' : 'NEEDS_REVISION',\n    reviewer_note: approved ? 'Human reviewer approved publication.' : 'Human reviewer flagged this for revision.'\n  } }];\n"
+      },
+      "id": "node-apply-review",
+      "name": "Apply Reviewer Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a-st-node-light",
+              "name": "status",
+              "type": "string",
+              "value": "AUTO_PUBLISHED_FLAGGED"
+            },
+            {
+              "id": "a-nt-node-light",
+              "name": "reviewer_note",
+              "type": "string",
+              "value": "Auto-published with caveats (partial or low-confidence claims). Flagged in the log for optional review."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "node-light",
+      "name": "Light Review Notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4040,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a-st-node-auto-pub",
+              "name": "status",
+              "type": "string",
+              "value": "AUTO_PUBLISHED"
+            },
+            {
+              "id": "a-nt-node-auto-pub",
+              "name": "reviewer_note",
+              "type": "string",
+              "value": "No human review required (high trust: weighted score and supported ratio both clear the thresholds, zero unsupported)."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "node-auto-pub",
+      "name": "Status: Auto-Published",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4040,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "  // DETERMINISTIC: build a clean HTML email report + a markdown copy + keep JSON.\n  const d = $json, s = d.stats;\n  const esc = (t) => String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n  const vColor = (v) => v === 'SUPPORTED' ? '#16a34a' : v === 'PARTIAL' ? '#d97706' : '#dc2626';\n  const stColor = d.status === 'NEEDS_REVISION' ? '#dc2626'\n    : d.status === 'AUTO_PUBLISHED_FLAGGED' ? '#d97706' : '#16a34a';\n\n  const mdRows = (d.verifications || []).map(v =>\n    `| ${v.id} | ${v.verdict} | ${v.confidence ?? ''} | ${String(v.claim || '').replace(/\\|/g, '/')} | ${String(v.evidence || '').replace(/\\|/g, '/').slice(0, 160)} |`\n  ).join('\\n');\n  const report_markdown = `# Verified Research Summary: ${d.title}\\n\\n` +\n    `**Status:** ${d.status}  |  **Route:** ${d.route}\\n` +\n    `**Trust score:** ${s.trust_score}% supported  ·  **Confidence-weighted:** ${s.weighted_score}%\\n` +\n    `**Claims:** ${s.supported}/${s.total} supported, ${s.partial} partial, ${s.unsupported} unsupported  ·  **Source chunks analysed:** ${s.n_chunks}\\n` +\n    `**Reviewer note:** ${d.reviewer_note || '-'}\\n\\n` +\n    `## Summary\\n${(d.summary && d.summary.summary) || '(summary unavailable)'}\\n\\n` +\n    `## Claim-by-Claim Verification\\n| # | Verdict | Conf | Claim | Evidence (from source) |\\n|---|---------|------|-------|------------------------|\\n${mdRows}\\n`;\n\n  const htmlRows = (d.verifications || []).map(v => `\n        <tr>\n          <td style=\"padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:center;color:#64748b;\">${v.id}</td>\n          <td style=\"padding:8px 10px;border-bottom:1px solid #e2e8f0;white-space:nowrap;\">\n            <span style=\"background:${vColor(v.verdict)};color:#fff;font-size:11px;font-weight:bold;padding:2px 8px;border-radius:10px;\">${v.verdict}</span>\n          </td>\n          <td style=\"padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:center;color:#64748b;\">${v.confidence ?? ''}</td>\n          <td style=\"padding:8px 10px;border-bottom:1px solid #e2e8f0;\">${esc(v.claim)}</td>\n          <td style=\"padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#475569;font-style:italic;\">${esc(v.evidence) || '<span style=\"color:#94a3b8;\">no evidence found</span>'}</td>\n        </tr>`).join('');\n\n  const report_html = `\n  <div style=\"font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:680px;margin:0 auto;color:#0f172a;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;\">\n    <div style=\"background:#0f172a;color:#fff;padding:20px 24px;\">\n      <div style=\"font-size:13px;letter-spacing:1px;color:#94a3b8;text-transform:uppercase;\">Veridict</div>\n      <div style=\"font-size:20px;font-weight:700;margin-top:4px;\">${esc(d.title)}</div>\n    </div>\n    <div style=\"padding:20px 24px;\">\n      <span style=\"display:inline-block;background:${stColor};color:#fff;font-weight:700;padding:6px 14px;border-radius:20px;font-size:13px;\">${d.status}</span>\n      <table style=\"width:100%;border-collapse:collapse;margin-top:16px;font-size:14px;\">\n        <tr><td style=\"padding:4px 0;color:#64748b;width:180px;\">Trust score</td><td style=\"padding:4px 0;font-weight:600;\">${s.trust_score}% supported</td></tr>\n        <tr><td style=\"padding:4px 0;color:#64748b;\">Confidence-weighted</td><td style=\"padding:4px 0;font-weight:600;\">${s.weighted_score}%</td></tr>\n        <tr><td style=\"padding:4px 0;color:#64748b;\">Claims</td><td style=\"padding:4px 0;\">${s.supported}/${s.total} supported, ${s.partial} partial, ${s.unsupported} unsupported</td></tr>\n        <tr><td style=\"padding:4px 0;color:#64748b;\">Source chunks</td><td style=\"padding:4px 0;\">${s.n_chunks}</td></tr>\n        <tr><td style=\"padding:4px 0;color:#64748b;\">Reviewer note</td><td style=\"padding:4px 0;\">${esc(d.reviewer_note) || '-'}</td></tr>\n      </table>\n      <h3 style=\"margin:20px 0 6px;font-size:15px;\">Summary</h3>\n      <p style=\"margin:0;line-height:1.6;color:#1e293b;\">${esc((d.summary && d.summary.summary) || '(summary unavailable)')}</p>\n      <h3 style=\"margin:22px 0 8px;font-size:15px;\">Claim-by-claim verification</h3>\n      <table style=\"width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;\">\n        <thead>\n          <tr style=\"background:#f1f5f9;text-align:left;\">\n            <th style=\"padding:8px 10px;\">#</th><th style=\"padding:8px 10px;\">Verdict</th><th style=\"padding:8px 10px;\">Conf</th><th style=\"padding:8px 10px;\">Claim</th><th style=\"padding:8px 10px;\">Evidence (from source)</th>\n          </tr>\n        </thead>\n        <tbody>${htmlRows}\n        </tbody>\n      </table>\n    </div>\n    <div style=\"background:#f8fafc;color:#94a3b8;padding:12px 24px;font-size:12px;border-top:1px solid #e2e8f0;\">Generated by Veridict. Trust score is the share of claims the independent Verifier found supported by the source.</div>\n  </div>`;\n\n  return [{ json: { ...d, report_markdown, report_html, generated_at: new Date().toISOString() } }];\n"
+      },
+      "id": "node-build-report",
+      "name": "Build Final Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4640,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.generated_at }}",
+            "title": "={{ $json.title }}",
+            "status": "={{ $json.status }}",
+            "route": "={{ $json.route }}",
+            "trust_score": "={{ $json.stats.trust_score }}",
+            "weighted_score": "={{ $json.stats.weighted_score }}",
+            "supported": "={{ $json.stats.supported }}",
+            "partial": "={{ $json.stats.partial }}",
+            "unsupported": "={{ $json.stats.unsupported }}",
+            "n_chunks": "={{ $json.stats.n_chunks }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-sheet",
+      "name": "Log to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        4920,
+        600
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.reviewer_email || $('Submit Article').first().json['Reviewer Email'] || 'me@example.com' }}",
+        "subject": "=[{{ $json.status }}] Verified summary: {{ $json.title }}",
+        "message": "={{ $('Build Final Report').first().json.report_html }}",
+        "options": {}
+      },
+      "id": "node-email",
+      "name": "Email Verified Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5200,
+        600
+      ],
+      "webhookId": "research-verifier-email",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "Done - verified summary ready",
+        "completionMessage": "={{ $('Build Final Report').first().json.report_html }}",
+        "options": {}
+      },
+      "id": "node-show-result",
+      "name": "Show Result",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [
+        5480,
+        600
+      ]
+    }
+  ],
+  "connections": {
+    "Submit Article": {
+      "main": [
+        [
+          {
+            "node": "Has URL?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has URL?": {
+      "main": [
+        [
+          {
+            "node": "Fetch URL Content",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use Pasted Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch URL Content": {
+      "main": [
+        [
+          {
+            "node": "Extract Text from HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text from HTML": {
+      "main": [
+        [
+          {
+            "node": "Validate & Prepare Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use Pasted Text": {
+      "main": [
+        [
+          {
+            "node": "Validate & Prepare Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Prepare Input": {
+      "main": [
+        [
+          {
+            "node": "Chunk Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk Source": {
+      "main": [
+        [
+          {
+            "node": "Summarizer Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq - Summarizer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Summarizer Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarizer Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse Chunk Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Chunk Summary": {
+      "main": [
+        [
+          {
+            "node": "Merge Chunk Summaries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Chunk Summaries": {
+      "main": [
+        [
+          {
+            "node": "Synthesize Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq - Synthesizer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Synthesize Summary",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Synthesize Summary": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Synthesis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Synthesis": {
+      "main": [
+        [
+          {
+            "node": "Retry Synthesis?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Synthesis?": {
+      "main": [
+        [
+          {
+            "node": "Synthesize Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inject Test Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject Test Claim": {
+      "main": [
+        [
+          {
+            "node": "Verifier Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq - Verifier": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Verifier Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verifier Agent": {
+      "main": [
+        [
+          {
+            "node": "Score & Decide Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & Decide Route": {
+      "main": [
+        [
+          {
+            "node": "Route by Trust Tier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Trust Tier": {
+      "main": [
+        [
+          {
+            "node": "Human Review (Approve/Reject)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Light Review Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Status: Auto-Published",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Review (Approve/Reject)": {
+      "main": [
+        [
+          {
+            "node": "Apply Reviewer Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Reviewer Decision": {
+      "main": [
+        [
+          {
+            "node": "Build Final Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Light Review Notice": {
+      "main": [
+        [
+          {
+            "node": "Build Final Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Status: Auto-Published": {
+      "main": [
+        [
+          {
+            "node": "Build Final Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Final Report": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Email Verified Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Verified Report": {
+      "main": [
+        [
+          {
+            "node": "Show Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

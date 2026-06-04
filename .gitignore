@@ -1,0 +1,21 @@
+# Secrets - never commit API keys
+.env
+.env.*
+*.key
+
+# Local tooling / runtime
+node_modules/
+.n8n-test/
+.n8n/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build & test scripts (kept local)
+build_workflow.js
+test_*.js
+scripts/

@@ -1,0 +1,23 @@
+flowchart LR
+ A([Submit Article]):::trigger --> B{Has URL?}:::control
+ B -->|yes| C[HTTP Fetch]:::tool --> D[Extract Text]:::det
+ B -->|no| E[Use Pasted Text]:::det
+ D --> F[Validate &amp; Prepare]:::det
+ E --> F
+ F --> G[Chunk Source<br/>MAP fan-out]:::det
+ G --> H[Summarizer · per chunk<br/>AI 1]:::ai --> I[Parse Chunk]:::det --> J[Merge Chunks<br/>REDUCE]:::det
+ J --> K[Synthesize<br/>AI 2]:::ai --> L[Parse &amp; Validate]:::det --> M{Retry?}:::control
+ M -->|invalid| K
+ M -->|valid| N[Inject Test Claim]:::det
+ N --> O[Verifier<br/>AI 3]:::ai --> P[Score &amp; Route<br/>weighted · 3-tier]:::det --> Q{Route by Tier}:::control
+ Q -->|HARD| R[Gmail Approve/Reject]:::human --> S[Apply Decision]:::det --> V[Build Report]:::det
+ Q -->|LIGHT| T[Light Notice]:::det --> V
+ Q -->|AUTO| U[Auto-Published]:::det --> V
+ V --> W[Log Sheet]:::tool --> X[Email]:::tool --> Y([Show Result]):::trigger
+
+ classDef ai fill:#7c3aed,stroke:#4c1d95,color:#fff,stroke-width:2px;
+ classDef det fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e;
+ classDef control fill:#fde68a,stroke:#b45309,color:#7c2d12;
+ classDef tool fill:#dcfce7,stroke:#15803d,color:#14532d;
+ classDef human fill:#fecaca,stroke:#b91c1c,color:#7f1d1d,stroke-width:2px;
+ classDef trigger fill:#f1f5f9,stroke:#475569,color:#1e293b;

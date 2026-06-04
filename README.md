@@ -4,13 +4,11 @@
 
 A multi-agent n8n workflow that turns any article/paper - short or long - into a **fact-checked summary with a trust score**. Long sources are split into chunks and summarized **map-reduce** style (a *Summarizer* runs per chunk, a *Synthesizer* merges them with a bounded self-correction retry); an independent *Verifier* agent then checks every claim against the original source. Deterministic logic computes a **confidence-weighted** trust score and routes each result down one of **three tiers** - auto-publish, light-review, or a **human reviewer** gate - before anything is published or logged.
 
-> Built for the *Agentic Workflow Design and n8n Demo* assignment (individual submission).
-
-**Demo video:** _<!-- PASTE YOUR VIDEO URL HERE (Google Drive / Loom, set to "anyone with the link can view") -->_
+**Demo video:** https://drive.google.com/file/d/1Mqu8VXIq4shloRsIOCEG3dDQrd3EDfhB/view?usp=sharing
 
 ---
 
-## 1. The problem (1-line)
+## 1. The problem
 
 LLM summaries hallucinate - they add claims that aren't in the source. You can't trust a summary without re-reading the paper. **This workflow makes the summary auditable** and stops untrustworthy output from being published silently.
 
@@ -186,7 +184,7 @@ The workflow is provider-agnostic. To switch, **delete** the three Groq model no
 
 ---
 
-## 6. Agentic practices checklist (assignment §6)
+## 6. Agentic practices checklist
 
 - **Agent roles** - Summarizer (per-chunk generator), Synthesizer (reducer), Verifier (critic) - three deliberately separated roles.
 - **Map-reduce** - long sources are chunked, summarized in parallel, then reduced into one summary.
